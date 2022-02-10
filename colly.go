@@ -41,10 +41,9 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/antchfx/htmlquery"
 	"github.com/antchfx/xmlquery"
-	"github.com/gocolly/colly/v2/debug"
-	"github.com/gocolly/colly/v2/storage"
+	"github.com/billiboy/colly2/v2/debug"
+	"github.com/billiboy/colly2/v2/storage"
 	"github.com/kennygrant/sanitize"
-	whatwgUrl "github.com/nlnwa/whatwg-url/url"
 	"github.com/temoto/robotstxt"
 	"google.golang.org/appengine/urlfetch"
 )
@@ -380,11 +379,7 @@ func ID(id uint32) CollectorOption {
 // Async turns on asynchronous network requests.
 func Async(a ...bool) CollectorOption {
 	return func(c *Collector) {
-		if len(a) > 0 {
-			c.Async = a[0]
-		} else {
-			c.Async = true
-		}
+		c.Async = true
 	}
 }
 
@@ -554,11 +549,7 @@ func (c *Collector) UnmarshalRequest(r []byte) (*Request, error) {
 }
 
 func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, ctx *Context, hdr http.Header, checkRevisit bool) error {
-	parsedWhatwgURL, err := whatwgUrl.Parse(u)
-	if err != nil {
-		return err
-	}
-	parsedURL, err := url.Parse(parsedWhatwgURL.Href(false))
+	parsedURL, err := url.Parse(u)
 	if err != nil {
 		return err
 	}
@@ -567,10 +558,7 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	}
 
 	if hdr == nil {
-		hdr = http.Header{}
-	}
-	if _, ok := hdr["User-Agent"]; !ok {
-		hdr.Set("User-Agent", c.UserAgent)
+		hdr = http.Header{"User-Agent": []string{c.UserAgent}}
 	}
 	rc, ok := requestData.(io.ReadCloser)
 	if !ok && requestData != nil {
@@ -672,21 +660,34 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		hTrace = &HTTPTrace{}
 		req = hTrace.WithTrace(req)
 	}
-	origURL := req.URL
-	checkHeadersFunc := func(req *http.Request, statusCode int, headers http.Header) bool {
-		if req.URL != origURL {
-			request.URL = req.URL
-			request.Headers = &req.Header
-		}
+	checkHeadersFunc := func(statusCode int, headers http.Header) bool {
 		c.handleOnResponseHeaders(&Response{Ctx: ctx, Request: request, StatusCode: statusCode, Headers: &headers})
 		return !request.abort
 	}
-	response, err := c.backend.Cache(req, c.MaxBodySize, checkHeadersFunc, c.CacheDir)
+
+	var response *Response
+	var err error
+	defer func() {
+		if response != nil {
+			response.Body = []byte{}
+			response.Headers = nil
+			response.Request = nil
+			response.Ctx = nil
+			response.Trace = nil
+			responsePool.Put(response)
+		}
+	}()
+	origURL := req.URL
+	response, err = c.backend.Cache(req, c.MaxBodySize, checkHeadersFunc, c.CacheDir)
 	if proxyURL, ok := req.Context().Value(ProxyURLKey).(string); ok {
 		request.ProxyURL = proxyURL
 	}
 	if err := c.handleOnError(response, err, request, ctx); err != nil {
 		return err
+	}
+	if req.URL != origURL {
+		request.URL = req.URL
+		request.Headers = &req.Header
 	}
 	atomic.AddUint32(&c.responseCount, 1)
 	response.Ctx = ctx
@@ -722,8 +723,18 @@ func (c *Collector) requestCheck(u string, parsedURL *url.URL, method string, re
 	if c.MaxDepth > 0 && c.MaxDepth < depth {
 		return ErrMaxDepth
 	}
-	if err := c.checkFilters(u, parsedURL.Hostname()); err != nil {
-		return err
+	if len(c.DisallowedURLFilters) > 0 {
+		if isMatchingFilter(c.DisallowedURLFilters, []byte(u)) {
+			return ErrForbiddenURL
+		}
+	}
+	if len(c.URLFilters) > 0 {
+		if !isMatchingFilter(c.URLFilters, []byte(u)) {
+			return ErrNoURLFiltersMatch
+		}
+	}
+	if !c.isDomainAllowed(parsedURL.Hostname()) {
+		return ErrForbiddenDomain
 	}
 	if method != "HEAD" && !c.IgnoreRobotsTxt {
 		if err := c.checkRobots(parsedURL); err != nil {
@@ -752,23 +763,6 @@ func (c *Collector) requestCheck(u string, parsedURL *url.URL, method string, re
 			return ErrAlreadyVisited
 		}
 		return c.store.Visited(uHash)
-	}
-	return nil
-}
-
-func (c *Collector) checkFilters(URL, domain string) error {
-	if len(c.DisallowedURLFilters) > 0 {
-		if isMatchingFilter(c.DisallowedURLFilters, []byte(URL)) {
-			return ErrForbiddenURL
-		}
-	}
-	if len(c.URLFilters) > 0 {
-		if !isMatchingFilter(c.URLFilters, []byte(URL)) {
-			return ErrNoURLFiltersMatch
-		}
-	}
-	if !c.isDomainAllowed(domain) {
-		return ErrForbiddenDomain
 	}
 	return nil
 }
@@ -832,8 +826,8 @@ func (c *Collector) checkRobots(u *url.URL) error {
 func (c *Collector) String() string {
 	return fmt.Sprintf(
 		"Requests made: %d (%d responses) | Callbacks: OnRequest: %d, OnHTML: %d, OnResponse: %d, OnError: %d",
-		atomic.LoadUint32(&c.requestCount),
-		atomic.LoadUint32(&c.responseCount),
+		c.requestCount,
+		c.responseCount,
 		len(c.requestCallbacks),
 		len(c.htmlCallbacks),
 		len(c.responseCallbacks),
@@ -1031,11 +1025,9 @@ func (c *Collector) SetProxyFunc(p ProxyFunc) {
 	t, ok := c.backend.Client.Transport.(*http.Transport)
 	if c.backend.Client.Transport != nil && ok {
 		t.Proxy = p
-		t.DisableKeepAlives = true
 	} else {
 		c.backend.Client.Transport = &http.Transport{
-			Proxy:             p,
-			DisableKeepAlives: true,
+			Proxy: p,
 		}
 	}
 }
@@ -1093,14 +1085,10 @@ func (c *Collector) handleOnHTML(resp *Response) error {
 		return err
 	}
 	if href, found := doc.Find("base[href]").Attr("href"); found {
-		u, err := whatwgUrl.ParseRef(resp.Request.URL.String(), href)
+		baseURL, err := resp.Request.URL.Parse(href)
 		if err == nil {
-			baseURL, err := url.Parse(u.Href(false))
-			if err == nil {
-				resp.Request.baseURL = baseURL
-			}
+			resp.Request.baseURL = baseURL
 		}
-
 	}
 	for _, cc := range c.htmlCallbacks {
 		i := 0
@@ -1305,9 +1293,10 @@ func (c *Collector) Clone() *Collector {
 
 func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
-		if err := c.checkFilters(req.URL.String(), req.URL.Hostname()); err != nil {
-			return fmt.Errorf("Not following redirect to %q: %w", req.URL, err)
+		if !c.isDomainAllowed(req.URL.Hostname()) {
+			return fmt.Errorf("Not following redirect to %s because its not in AllowedDomains", req.URL.Host)
 		}
+
 		if c.redirectHandler != nil {
 			return c.redirectHandler(req, via)
 		}
