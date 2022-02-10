@@ -40,7 +40,11 @@ type httpBackend struct {
 	lock       *sync.RWMutex
 }
 
-type checkHeadersFunc func(req *http.Request, statusCode int, header http.Header) bool
+var responsePool = sync.Pool{New: func() interface{} {
+	return &Response{}
+}}
+
+type checkHeadersFunc func(statusCode int, header http.Header) bool
 
 // LimitRule provides connection restrictions for domains.
 // Both DomainRegexp and DomainGlob can be used to specify
@@ -130,7 +134,7 @@ func (h *httpBackend) GetMatchingRule(domain string) *LimitRule {
 }
 
 func (h *httpBackend) Cache(request *http.Request, bodySize int, checkHeadersFunc checkHeadersFunc, cacheDir string) (*Response, error) {
-	if cacheDir == "" || request.Method != "GET" || request.Header.Get("Cache-Control") == "no-cache" {
+	if cacheDir == "" || request.Method != "GET" {
 		return h.Do(request, bodySize, checkHeadersFunc)
 	}
 	sum := sha1.Sum([]byte(request.URL.String()))
@@ -141,7 +145,6 @@ func (h *httpBackend) Cache(request *http.Request, bodySize int, checkHeadersFun
 		resp := new(Response)
 		err := gob.NewDecoder(file).Decode(resp)
 		file.Close()
-		checkHeadersFunc(request, resp.StatusCode, *resp.Headers)
 		if resp.StatusCode < 500 {
 			return resp, err
 		}
@@ -189,7 +192,7 @@ func (h *httpBackend) Do(request *http.Request, bodySize int, checkHeadersFunc c
 	if res.Request != nil {
 		*request = *res.Request
 	}
-	if !checkHeadersFunc(request, res.StatusCode, res.Header) {
+	if !checkHeadersFunc(res.StatusCode, res.Header) {
 		// closing res.Body (see defer above) without reading it aborts
 		// the download
 		return nil, ErrAbortedAfterHeaders
@@ -211,11 +214,11 @@ func (h *httpBackend) Do(request *http.Request, bodySize int, checkHeadersFunc c
 	if err != nil {
 		return nil, err
 	}
-	return &Response{
-		StatusCode: res.StatusCode,
-		Body:       body,
-		Headers:    &res.Header,
-	}, nil
+	response := responsePool.Get().(*Response)
+	response.StatusCode = res.StatusCode
+	response.Body = body
+	response.Headers = &res.Header
+	return response, nil
 }
 
 func (h *httpBackend) Limit(rule *LimitRule) error {
